@@ -1,5 +1,5 @@
 import inspect
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from enum import Enum
 from typing import (
     Any,
@@ -191,6 +191,42 @@ BlockSchemaInputType = TypeVar("BlockSchemaInputType", bound=BlockSchema)
 BlockSchemaOutputType = TypeVar("BlockSchemaOutputType", bound=BlockSchema)
 
 
+class SchemaValidator(ABC):
+    """Interface for schema validation"""
+    
+    @abstractmethod
+    def validate_data(self, data: BlockInput) -> str | None:
+        """Validate complete input/output data"""
+        pass
+
+    @abstractmethod 
+    def validate_field(self, field_name: str, data: BlockInput) -> str | None:
+        """Validate a specific field's data"""
+        pass
+
+    @abstractproperty
+    def schema(self) -> dict[str, Any]:
+        """Get the complete schema"""
+        pass
+
+
+class PydanticSchemaValidator(SchemaValidator):
+    """Schema validator implementation using Pydantic models"""
+
+    def __init__(self, schema_cls: Type[BlockSchema]):
+        self._schema_cls = schema_cls
+
+    def validate_data(self, data: BlockInput) -> str | None:
+        return self._schema_cls.validate_data(data)
+
+    def validate_field(self, field_name: str, data: BlockInput) -> str | None:
+        return self._schema_cls.validate_field(field_name, data)
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        return self._schema_cls.jsonschema()
+
+
 class EmptySchema(BlockSchema):
     pass
 
@@ -254,6 +290,8 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         categories: set[BlockCategory] | None = None,
         input_schema: Type[BlockSchemaInputType] = EmptySchema,
         output_schema: Type[BlockSchemaOutputType] = EmptySchema,
+        input_validator: Optional[SchemaValidator] = None,
+        output_validator: Optional[SchemaValidator] = None,
         test_input: BlockInput | list[BlockInput] | None = None,
         test_output: BlockData | list[BlockData] | None = None,
         test_mock: dict[str, Any] | None = None,
@@ -281,8 +319,10 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             static_output: Whether the output links of the block are static by default.
         """
         self.id = id
-        self.input_schema = input_schema
+        self.input_schema = input_schema 
         self.output_schema = output_schema
+        self.input_validator = input_validator or PydanticSchemaValidator(input_schema)
+        self.output_validator = output_validator or PydanticSchemaValidator(output_schema)
         self.test_input = test_input
         self.test_output = test_output
         self.test_mock = test_mock
@@ -386,8 +426,8 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         return {
             "id": self.id,
             "name": self.name,
-            "inputSchema": self.input_schema.jsonschema(),
-            "outputSchema": self.output_schema.jsonschema(),
+            "inputSchema": self.input_validator.schema,
+            "outputSchema": self.output_validator.schema,
             "description": self.description,
             "categories": [category.dict() for category in self.categories],
             "contributors": [
@@ -399,7 +439,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
 
     def execute(self, input_data: BlockInput, **kwargs) -> BlockOutput:
         # Merge the input data with the extra execution arguments, preferring the args for security
-        if error := self.input_schema.validate_data(input_data):
+        if error := self.input_validator.validate_data(input_data):
             raise ValueError(
                 f"Unable to execute block with invalid input data: {error}"
             )
@@ -410,7 +450,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             if output_name == "error":
                 raise RuntimeError(output_data)
             if self.block_type == BlockType.STANDARD and (
-                error := self.output_schema.validate_field(output_name, output_data)
+                error := self.output_validator.validate_field(output_name, output_data)
             ):
                 raise ValueError(f"Block produced an invalid output data: {error}")
             yield output_name, output_data
